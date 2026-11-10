@@ -126,6 +126,20 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent-strong)
 .nav a.active svg { color: var(--accent-strong); }
 .sidebar-foot { margin-top: auto; display: grid; gap: 8px; padding: 0 4px; }
 .sidebar-foot small { color: var(--muted); font-size: 11px; padding: 0 8px; }
+/* cloud sync status */
+.sync-pill { display: flex; align-items: center; gap: 8px; width: 100%; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface2); color: var(--muted); font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; text-align: left; }
+.sync-pill:hover { color: var(--text); border-color: var(--muted); }
+.sync-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; display: inline-block; }
+[data-state="synced"] .sync-dot { background: var(--ok); }
+[data-state="saving"] .sync-dot, [data-state="connecting"] .sync-dot { background: var(--warn); animation: syncPulse 1s ease-in-out infinite; }
+[data-state="error"] .sync-dot, [data-state="unavailable"] .sync-dot { background: var(--danger); }
+[data-state="link"] .sync-dot { background: var(--blue); }
+@keyframes syncPulse { 50% { opacity: .35; } }
+.sync-btn-m { position: relative; }
+.sync-btn-m .sync-dot { width: 10px; height: 10px; }
+.sync-err { color: var(--danger); font-size: 13px; min-height: 18px; }
+.sync-info { display: grid; gap: 6px; font-size: 13px; }
+.sync-info b { font-weight: 600; }
 main { padding: 28px 32px 80px; width: 100%; max-width: 1240px; min-width: 0; }
 .mobile-top, .bottom-nav { display: none; }
 
@@ -596,13 +610,15 @@ table.sets .input.invalid { border-color: var(--red, #e5484d); }
     <a class="brand" href="#/dashboard" id="brand-desktop"></a>
     <nav class="nav" id="nav-desktop"></nav>
     <div class="sidebar-foot">
+      <button class="sync-pill" data-action="sync-open" id="sync-pill" data-state="off"><i class="sync-dot"></i><span>Sign in to sync</span></button>
       <button class="btn btn-ghost w100" data-action="theme-toggle" id="theme-btn"></button>
-      <small>Data is saved in this browser (localStorage)</small>
+      <small id="sync-note">Data is saved in this browser (localStorage)</small>
     </div>
   </aside>
   <header class="mobile-top">
     <a class="brand" href="#/dashboard" id="brand-mobile"></a>
     <div class="row">
+      <button class="icon-btn sync-btn-m" data-action="sync-open" id="sync-btn-m" data-state="off" aria-label="Cloud sync"><i class="sync-dot"></i></button>
       <button class="icon-btn" data-action="theme-toggle" id="theme-btn-m" aria-label="Toggle theme"></button>
       <a class="icon-btn" href="#/settings" id="settings-m" aria-label="Settings"></a>
     </div>
@@ -747,11 +763,16 @@ const Store = {
     clearTimeout(saveTimer); saveTimer = null;
     try { localStorage.setItem(KEY, JSON.stringify(S)); }
     catch (e) { toast('Could not save — browser storage is full or blocked.', 'error'); }
+    Sync.queue();
   },
-  flush() { if (saveTimer) Store.saveNow(); },
+  flush() { if (saveTimer) Store.saveNow(); Sync.push(); },
   savePhotos() {
+    Sync.queue();
     try { localStorage.setItem(PKEY, JSON.stringify(PHOTOS)); return true; }
-    catch (e) { toast('Storage full — photo not saved. Delete some photos or export a backup.', 'error'); return false; }
+    catch (e) {
+      if (Sync.user) return true; // signed in: the cloud keeps the photo even when this browser's storage is full
+      toast('Storage full — photo not saved. Delete some photos or export a backup.', 'error'); return false;
+    }
   },
   usage() {
     let n = 0;
@@ -805,17 +826,20 @@ const ExImg = {
     if (this.mode === 'idb') await this.tx('readwrite', s => s.put(rec));
     if (old) this.list[i] = rec; else this.list.push(rec);
     try { this.writeLS(); } catch (e) { if (old) this.list[i] = old; else this.list.pop(); throw e; }
+    Sync.queue();
   },
   async remove(ids) {
     const set = new Set(ids);
     if (this.mode === 'idb') await this.tx('readwrite', s => { ids.forEach(id => s.delete(id)); return null; });
     this.list = this.list.filter(x => !set.has(x.id));
     try { this.writeLS(); } catch (e) {}
+    Sync.queue();
   },
   async clear() {
     if (this.mode === 'idb') await this.tx('readwrite', s => s.clear());
     this.list = [];
     try { this.writeLS(); } catch (e) {}
+    Sync.queue();
   },
   // Remove images whose exercise no longer exists (after deleting an exercise, day, week or season).
   async prune() {
@@ -826,6 +850,410 @@ const ExImg = {
     if (dead.length) { try { await this.remove(dead); } catch (e) { console.warn(e); } }
     return dead.length;
   },
+};
+
+/* ============================================================
+   CLOUD SYNC — Firebase Auth (email + password) and Firestore, real time.
+   The app keeps working from localStorage; when signed in, the state is
+   also split into small documents under users/{uid}/parts/{key}:
+     settings · library · body · notes · misc · seasons (metadata + week order)
+     week_<id> · photo_<id> · img_<id>
+   Each document holds the JSON in `j` and the client time of the edit in `t`.
+   Every device listens to that collection, so an edit on one shows up on the
+   others within a second or two. `meta.base[key]` remembers the version this
+   device last agreed with the cloud ({l: local hash, c: cloud hash}); after
+   offline edits it tells which side changed, and the newer edit wins.
+   ============================================================ */
+const FIREBASE_CONFIG = {
+  apiKey: 'AIzaSyCkQ9oEV7usu_K9qUagtF249hDiXfsz8j0',
+  authDomain: 'adrian-pump.firebaseapp.com',
+  projectId: 'adrian-pump',
+  storageBucket: 'adrian-pump.firebasestorage.app',
+  messagingSenderId: '348424728866',
+  appId: '1:348424728866:web:3887b472694c13deed757b',
+};
+const FIREBASE_SDK = 'https://www.gstatic.com/firebasejs/10.12.2/';
+const SYNC_META_KEY = 'adrianPump.sync';
+const SYNC_LOCAL_SETTINGS = ['activeSeasonId', 'activeWeekId', 'mmMode']; // per-device view state, never synced
+const SYNC_MAX_DOC = 1000000; // Firestore allows 1 MiB per document
+const SYNC_LABEL = { off: 'Sign in to sync', connecting: 'Connecting…', link: 'Finish cloud setup', synced: 'Synced', saving: 'Saving…', offline: 'Offline — will sync later', error: 'Sync error', unavailable: 'Cloud sync unavailable' };
+const isMediaKey = k => /^(photo|img)_/.test(k);
+function strHash(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return (h >>> 0).toString(36) + '.' + s.length;
+}
+// Photos and images are big and rarely change, so they get a cheap fingerprint instead of a full hash.
+function mediaFp(r) {
+  const { dataUrl = '', ...rest } = r || {};
+  return strHash(JSON.stringify(rest)) + '.' + dataUrl.length + '.' + strHash(dataUrl.slice(-96));
+}
+
+const Sync = {
+  fs: null, authApi: null, auth: null, db: null, user: null, unsub: null,
+  state: 'off', merged: false, applying: false, linking: false, timer: null, pending: 0,
+  inflight: {}, tooBig: {}, cloudSnapshot: null, pendingRender: false, lastSync: null, lastError: '',
+  meta: { uid: null, linked: false, base: {}, lt: {} },
+  dev: (() => { try { let d = localStorage.getItem('adrianPump.device'); if (!d) { d = uid(); localStorage.setItem('adrianPump.device', d); } return d; } catch (e) { return uid(); } })(),
+
+  /* ---------- bookkeeping ---------- */
+  loadMeta(id) {
+    let m = null;
+    try { m = JSON.parse(localStorage.getItem(SYNC_META_KEY) || 'null'); } catch (e) {}
+    this.meta = m && m.uid === id ? { linked: false, base: {}, lt: {}, ...m } : { uid: id, linked: false, base: {}, lt: {} };
+  },
+  saveMeta() { try { localStorage.setItem(SYNC_META_KEY, JSON.stringify(this.meta)); } catch (e) {} },
+
+  // The app state as documents: key -> { h: hash, s(): JSON string }.
+  parts() {
+    const out = {};
+    const put = (k, v) => { const s = JSON.stringify(v); out[k] = { h: strHash(s), s: () => s }; };
+    const settings = { ...S.settings };
+    SYNC_LOCAL_SETTINGS.forEach(k => delete settings[k]);
+    put('settings', settings);
+    ['library', 'body', 'notes'].forEach(k => put(k, S[k]));
+    const misc = {};
+    Object.keys(S).forEach(k => { if (!['settings', 'library', 'body', 'notes', 'seasons'].includes(k)) misc[k] = S[k]; });
+    put('misc', misc);
+    put('seasons', S.seasons.map(s => { const { weeks, ...m } = s; return { ...m, weekIds: weeks.map(w => w.id) }; }));
+    S.seasons.forEach(s => s.weeks.forEach(w => put('week_' + w.id, { seasonId: s.id, week: w })));
+    PHOTOS.forEach(p => { out['photo_' + p.id] = { h: mediaFp(p), s: () => JSON.stringify(p) }; });
+    ExImg.list.forEach(x => { out['img_' + x.id] = { h: mediaFp(x), s: () => JSON.stringify(x) }; });
+    return out;
+  },
+  cloudHash(k, j) {
+    if (!isMediaKey(k)) return strHash(j);
+    try { return mediaFp(JSON.parse(j)); } catch (e) { return strHash(j); }
+  },
+  // Rebuild S from parsed documents, keeping this device's view settings.
+  assemble(cur) {
+    const local = {};
+    SYNC_LOCAL_SETTINGS.forEach(k => { if (S && S.settings && k in S.settings) local[k] = S.settings[k]; });
+    const d = { ...(cur.misc || {}), settings: { ...(cur.settings || {}), ...local }, library: cur.library || [], body: cur.body || [], notes: cur.notes || [] };
+    const weeks = Object.keys(cur).filter(k => k.startsWith('week_')).map(k => cur[k]);
+    d.seasons = (cur.seasons || []).map(m => {
+      const { weekIds = [], ...s } = m;
+      const order = new Map(weekIds.map((id, i) => [id, i]));
+      const pos = w => order.has(w.id) ? order.get(w.id) : 1e9;
+      return { ...s, weeks: weeks.filter(w => w.seasonId === s.id).map(w => w.week).sort((a, b) => pos(a) - pos(b)) };
+    });
+    return migrate(d);
+  },
+
+  /* ---------- applying cloud changes ---------- */
+  async applyRemote(changes) {
+    if (!changes.length) return;
+    this.applying = true;
+    try {
+      const core = changes.filter(c => !isMediaKey(c.k));
+      if (core.length) {
+        const P = this.parts(), cur = {};
+        Object.keys(P).forEach(k => { if (!isMediaKey(k)) cur[k] = JSON.parse(P[k].s()); });
+        core.forEach(c => { if (c.j == null) delete cur[c.k]; else cur[c.k] = JSON.parse(c.j); });
+        S = this.assemble(cur);
+        REV++;
+        try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {}
+      }
+      const photos = changes.filter(c => c.k.startsWith('photo_'));
+      photos.forEach(c => {
+        const id = c.k.slice(6), i = PHOTOS.findIndex(p => p.id === id);
+        if (c.j == null) { if (i >= 0) PHOTOS.splice(i, 1); }
+        else { const p = JSON.parse(c.j); if (i >= 0) PHOTOS[i] = p; else PHOTOS.push(p); }
+      });
+      if (photos.length) { try { localStorage.setItem(PKEY, JSON.stringify(PHOTOS)); } catch (e) { /* the cloud still has them */ } }
+      for (const c of changes.filter(c => c.k.startsWith('img_'))) {
+        try { if (c.j == null) await ExImg.remove([c.k.slice(4)]); else await ExImg.put(JSON.parse(c.j)); }
+        catch (e) { console.warn('Could not store a synced exercise image', e); }
+      }
+    } finally { this.applying = false; }
+    const P = this.parts();
+    changes.forEach(c => {
+      if (c.j == null) delete this.meta.base[c.k];
+      else this.meta.base[c.k] = { l: P[c.k] ? P[c.k].h : '', c: this.cloudHash(c.k, c.j) };
+      this.meta.lt[c.k] = c.t || 0;
+    });
+    this.saveMeta();
+    this.rerender();
+  },
+  // Re-render for remote changes, but never while the user is typing or has a dialog open.
+  rerender() {
+    const a = document.activeElement;
+    const typing = a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.closest('#view');
+    if (typing || Modal.isOpen()) { this.pendingRender = true; return; }
+    this.pendingRender = false;
+    render();
+  },
+
+  /* ---------- pushing local changes ---------- */
+  queue() {
+    if (!this.merged || this.applying) return;
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => this.push(), 500);
+  },
+  push() {
+    clearTimeout(this.timer);
+    if (!this.merged || !this.user || this.applying) return;
+    const P = this.parts(), B = this.meta.base, now = Date.now();
+    const sets = Object.keys(P).filter(k => (!B[k] || B[k].l !== P[k].h) && this.inflight[k] !== P[k].h);
+    const dels = Object.keys(B).filter(k => !P[k] && this.inflight[k] !== 'del');
+    if (!sets.length && !dels.length) return;
+    const { doc, setDoc, deleteDoc } = this.fs;
+    const ref = k => doc(this.db, 'users', this.user.uid, 'parts', k);
+    const run = (k, tag, promise, done) => {
+      this.inflight[k] = tag; this.pending++;
+      this.setState(navigator.onLine === false ? 'offline' : 'saving');
+      promise.then(done).catch(e => this.fail(e)).finally(() => { if (this.inflight[k] === tag) delete this.inflight[k]; this.pending--; this.settle(); });
+    };
+    sets.forEach(k => {
+      const h = P[k].h, j = P[k].s();
+      if (j.length > SYNC_MAX_DOC) {
+        if (!this.tooBig[k]) { this.tooBig[k] = 1; toast('One image is too large to sync (over 1 MB) — it stays on this device only.', 'error'); }
+        return;
+      }
+      this.meta.lt[k] = now;
+      run(k, h, setDoc(ref(k), { j, t: now, dev: this.dev }), () => { this.meta.base[k] = { l: h, c: this.cloudHash(k, j) }; this.saveMeta(); });
+    });
+    dels.forEach(k => {
+      this.meta.lt[k] = now;
+      run(k, 'del', deleteDoc(ref(k)), () => { delete this.meta.base[k]; this.saveMeta(); });
+    });
+    this.saveMeta();
+  },
+  settle() {
+    if (this.pending > 0 || !this.user || !this.merged) return;
+    this.lastSync = new Date();
+    if (this.state !== 'error') this.setState(navigator.onLine === false ? 'offline' : 'synced');
+  },
+  fail(e) {
+    console.warn('Cloud sync error:', e);
+    this.lastError = e && e.code === 'permission-denied' ? 'The cloud refused the request (permission-denied). Check the Firestore rules.' : String((e && (e.code || e.message)) || e);
+    this.setState('error');
+  },
+
+  /* ---------- connecting ---------- */
+  async start() {
+    if (this.fs) return;
+    this.setState('connecting');
+    try {
+      const [appMod, authMod, fsMod] = await Promise.all(['firebase-app.js', 'firebase-auth.js', 'firebase-firestore.js'].map(f => import(FIREBASE_SDK + f)));
+      this.fs = fsMod; this.authApi = authMod;
+      const app = appMod.initializeApp(FIREBASE_CONFIG);
+      this.auth = authMod.initializeAuth(app, { persistence: [authMod.indexedDBLocalPersistence, authMod.browserLocalPersistence, authMod.inMemoryPersistence] });
+      this.db = fsMod.initializeFirestore(app, { experimentalAutoDetectLongPolling: true });
+      authMod.onAuthStateChanged(this.auth, u => this.onUser(u));
+    } catch (e) {
+      console.warn('Cloud sync unavailable:', e);
+      this.fs = null;
+      this.setState('unavailable');
+    }
+  },
+  onUser(u) {
+    if (this.unsub) { this.unsub(); this.unsub = null; }
+    this.user = u || null; this.merged = false; this.cloudSnapshot = null; this.lastError = '';
+    if (!u) { this.setState('off'); return; }
+    this.loadMeta(u.uid);
+    this.setState('connecting');
+    const col = this.fs.collection(this.db, 'users', u.uid, 'parts');
+    this.unsub = this.fs.onSnapshot(col, snap => this.onSnap(snap), e => this.fail(e));
+  },
+  onSnap(snap) {
+    if (!this.merged) {
+      if (snap.metadata.fromCache) return; // wait for the server's answer
+      const cloud = {};
+      snap.forEach(d => { const v = d.data(); cloud[d.id] = { j: v.j, t: v.t || 0 }; });
+      this.cloudSnapshot = cloud;
+      if (!this.meta.linked) { this.setState('link'); this.linkDialog(); }
+      else if (!this.merging) { this.merging = true; this.firstMerge(cloud).finally(() => { this.merging = false; }); }
+      return;
+    }
+    const changes = [];
+    snap.docChanges().forEach(ch => {
+      const d = ch.doc;
+      if (d.metadata.hasPendingWrites) return; // our own write echoing back
+      const k = d.id, b = this.meta.base[k];
+      if (ch.type === 'removed') { if (b) changes.push({ k, j: null, t: Date.now() }); return; }
+      const v = d.data();
+      if (b && b.c === this.cloudHash(k, v.j)) return; // already have this version
+      changes.push({ k, j: v.j, t: v.t || 0 });
+    });
+    if (!changes.length) return;
+    const P = this.parts();
+    // keep a local edit that is newer than the incoming one; push() sends it afterwards
+    const take = changes.filter(c => {
+      const b = this.meta.base[c.k], L = P[c.k];
+      const editedHere = L ? (!b || b.l !== L.h) : !!b;
+      return !editedHere || (c.t || 0) >= (this.meta.lt[c.k] || 0);
+    });
+    this.applyRemote(take).then(() => { this.queue(); this.settle(); });
+  },
+  // Reconcile after this device was offline or closed: per document, whichever side changed wins.
+  async firstMerge(cloud) {
+    const P = this.parts(), B = this.meta.base, lt = this.meta.lt;
+    const take = [];
+    new Set([...Object.keys(P), ...Object.keys(cloud), ...Object.keys(B)]).forEach(k => {
+      const L = P[k], C = cloud[k], b = B[k], cH = C ? this.cloudHash(k, C.j) : null;
+      if (L && C) {
+        if (L.h === cH) { B[k] = { l: L.h, c: cH }; return; }
+        const editedHere = !b || b.l !== L.h, editedThere = !b || b.c !== cH;
+        if (!editedHere && editedThere) take.push({ k, j: C.j, t: C.t });
+        else if (editedHere && editedThere && (C.t || 0) > (lt[k] || 0)) take.push({ k, j: C.j, t: C.t });
+      } else if (C) {
+        if (!b || (b.c !== cH && (C.t || 0) > (lt[k] || 0))) take.push({ k, j: C.j, t: C.t }); // else: deleted here, push() deletes it
+      } else if (L) {
+        if (b && b.l === L.h) take.push({ k, j: null, t: Date.now() }); // deleted on another device
+      } else delete B[k];
+    });
+    await this.applyRemote(take);
+    this.merged = true;
+    this.push();
+    this.settle();
+  },
+
+  /* ---------- first sign-in on a device ---------- */
+  linkDialog() {
+    if (this.linking || !this.cloudSnapshot) return;
+    this.linking = true;
+    const cloud = this.cloudSnapshot, count = p => Object.keys(cloud).filter(k => k.startsWith(p)).length;
+    const localWeeks = S.seasons.reduce((a, s) => a + s.weeks.length, 0);
+    const here = `${localWeeks} weeks · ${S.body.length} body entries · ${PHOTOS.length} photos · ${ExImg.list.length} exercise images`;
+    const done = () => { this.linking = false; };
+    if (!Object.keys(cloud).length) {
+      Modal.open({
+        title: 'Set up cloud sync', onClose: done,
+        body: `<p>Your cloud is empty. Upload this device's data so your other devices can use it?</p><p class="muted small">This device: ${here}.</p>`,
+        actions: [{ label: 'Not now', onClick: done }, { label: 'Upload to cloud', cls: 'btn-primary', onClick: () => { done(); this.useLocal(); } }],
+      });
+    } else {
+      Modal.open({
+        title: 'Cloud data found', onClose: done,
+        body: `<p>Your cloud already has data: <b>${count('week_')} weeks</b>, ${count('photo_')} photos, ${count('img_')} exercise images.</p>
+          <p>This device has ${here}.</p>
+          <p class="muted small">Pick the copy to keep; the other is replaced. Using the cloud data is right for a new phone or browser. A backup of this device's workouts is kept in the browser either way.</p>`,
+        actions: [
+          { label: 'Replace cloud with this device', cls: 'btn-danger left', onClick: () => { done(); this.confirmReplaceCloud(); } },
+          { label: 'Use cloud data here', cls: 'btn-primary', onClick: () => { done(); this.useCloud(); } },
+        ],
+      });
+    }
+  },
+  async confirmReplaceCloud() {
+    if (await confirmDialog('This overwrites the data in your cloud — and so on every other device — with this device\'s data.', { title: 'Replace cloud data?', ok: 'Replace cloud' })) this.useLocal();
+    else this.linkDialog();
+  },
+  backupLocal() { try { localStorage.setItem(KEY + '.beforeCloud', JSON.stringify(S)); } catch (e) {} },
+  async useCloud() {
+    this.backupLocal();
+    const cloud = this.cloudSnapshot || {}, P = this.parts();
+    const changes = Object.keys(cloud).map(k => ({ k, j: cloud[k].j, t: cloud[k].t }));
+    Object.keys(P).forEach(k => { if (!cloud[k]) changes.push({ k, j: null, t: 0 }); });
+    this.meta.base = {}; this.meta.lt = {};
+    await this.applyRemote(changes);
+    this.meta.linked = true; this.saveMeta();
+    this.merged = true;
+    this.push(); this.settle();
+    toast('Cloud data loaded on this device');
+  },
+  useLocal() {
+    this.backupLocal();
+    const cloud = this.cloudSnapshot || {};
+    this.meta.base = {}; this.meta.lt = {};
+    // every cloud document gets overwritten or, if this device doesn't have it, deleted
+    Object.keys(cloud).forEach(k => { this.meta.base[k] = { l: '', c: this.cloudHash(k, cloud[k].j) }; });
+    this.meta.linked = true; this.saveMeta();
+    this.merged = true;
+    this.push(); this.settle();
+    toast('Uploading this device\'s data…');
+  },
+
+  /* ---------- UI ---------- */
+  setState(s) {
+    this.state = s;
+    const label = SYNC_LABEL[s] || s;
+    const pill = $('#sync-pill');
+    if (pill) { pill.dataset.state = s; pill.querySelector('span').textContent = s === 'error' ? 'Sync error — tap for details' : label; pill.title = this.user ? this.user.email : ''; }
+    const m = $('#sync-btn-m');
+    if (m) { m.dataset.state = s; m.title = label; m.setAttribute('aria-label', 'Cloud sync: ' + label); }
+    const n = $('#sync-note');
+    if (n) n.textContent = this.user ? 'Synced to your cloud account' : 'Data is saved in this browser (localStorage)';
+    const card = $('#sync-card');
+    if (card) card.innerHTML = this.cardHTML();
+  },
+  infoHTML() {
+    return `<div>Signed in as <b>${esc(this.user.email)}</b></div>
+      <div>Status: <b>${SYNC_LABEL[this.state] || this.state}</b>${this.lastSync ? ` · last saved ${this.lastSync.toLocaleTimeString()}` : ''}</div>
+      ${this.lastError ? `<div class="sync-err">${esc(this.lastError)}</div>` : ''}
+      <div class="muted small">Edits show up on your other signed-in devices within a second or two. Edits made offline are kept and uploaded when you reconnect.</div>`;
+  },
+  cardHTML() {
+    if (!this.user) {
+      return `<div class="card-head"><h3>Cloud sync</h3><span class="row small muted" data-state="${this.state}"><i class="sync-dot"></i>${SYNC_LABEL[this.state] || ''}</span></div>
+        <p class="muted">Sign in to keep your phone and computer in sync in real time. Without signing in, data stays in this browser only.</p>
+        <button class="btn btn-primary" data-action="sync-open">Sign in</button>`;
+    }
+    return `<div class="card-head"><h3>Cloud sync</h3><span class="row small" data-state="${this.state}"><i class="sync-dot"></i>${SYNC_LABEL[this.state] || ''}</span></div>
+      <div class="sync-info">${this.infoHTML()}</div>
+      <div class="row mt"><button class="btn" data-action="sync-open">Details</button><button class="btn btn-danger" data-action="sync-signout">Sign out</button></div>`;
+  },
+  open() {
+    if (this.state === 'link') { this.linkDialog(); return; }
+    if (this.state === 'unavailable') {
+      Modal.open({ title: 'Cloud sync', body: '<p>The sync service could not be loaded. Check your internet connection, then reload the page.</p>', actions: [{ label: 'Close' }, { label: 'Reload', cls: 'btn-primary', onClick: () => location.reload() }] });
+      return;
+    }
+    if (!this.fs) { toast('Cloud sync is still loading…'); return; }
+    if (!this.user) { this.signInDialog(); return; }
+    Modal.open({
+      title: 'Cloud sync', body: `<div class="sync-info">${this.infoHTML()}</div>`,
+      actions: [
+        { label: 'Sign out', cls: 'left', onClick: () => { this.signOut(); } },
+        { label: 'Close' },
+        { label: 'Sync now', cls: 'btn-primary', onClick: () => { this.lastError = ''; this.push(); this.settle(); } },
+      ],
+    });
+  },
+  signInDialog() {
+    Modal.open({
+      title: 'Sign in to sync',
+      body: `<div class="form">
+        <p class="muted small">Use the account you created in Firebase. Your data syncs to every device where you sign in.</p>
+        ${field('Email', '<input class="input" type="email" id="sync-email" autocomplete="username" inputmode="email" autocapitalize="off" spellcheck="false">')}
+        ${field('Password', '<input class="input" type="password" id="sync-pass" autocomplete="current-password">')}
+        <div class="sync-err" id="sync-err" role="alert"></div>
+        <div><button class="btn btn-ghost btn-sm" data-action="sync-reset">Forgot password?</button></div>
+      </div>`,
+      actions: [{ label: 'Cancel' }, { label: 'Sign in', cls: 'btn-primary', onClick: () => { this.signIn(); return false; } }],
+    });
+  },
+  async signIn() {
+    const email = $('#sync-email').value.trim(), pass = $('#sync-pass').value, err = $('#sync-err');
+    if (!email || !pass) { err.textContent = 'Enter your email and password.'; return; }
+    err.textContent = 'Signing in…';
+    try { await this.authApi.signInWithEmailAndPassword(this.auth, email, pass); Modal.close(); toast('Signed in — syncing…'); }
+    catch (e) { if ($('#sync-err')) $('#sync-err').textContent = this.authMsg(e); }
+  },
+  async resetPassword() {
+    const el = $('#sync-email'), err = $('#sync-err'), email = el ? el.value.trim() : '';
+    if (!email) { err.textContent = 'Type your email above first.'; return; }
+    try { await this.authApi.sendPasswordResetEmail(this.auth, email); err.textContent = 'If that account exists, a reset link has been sent to it.'; }
+    catch (e) { err.textContent = this.authMsg(e); }
+  },
+  authMsg(e) {
+    const c = (e && e.code) || '';
+    const M = {
+      'auth/invalid-credential': 'Wrong email or password.', 'auth/wrong-password': 'Wrong email or password.', 'auth/user-not-found': 'Wrong email or password.',
+      'auth/invalid-email': 'That email address is not valid.', 'auth/user-disabled': 'This account is disabled.',
+      'auth/too-many-requests': 'Too many attempts — wait a few minutes, then try again.',
+      'auth/network-request-failed': 'Cannot reach the sign-in server. Check your internet connection.',
+    };
+    return M[c] || `Sign-in failed (${c || (e && e.message) || 'unknown error'}).`;
+  },
+  async signOut() {
+    this.push();
+    try { await this.authApi.signOut(this.auth); toast('Signed out — your data stays on this device'); }
+    catch (e) { toast('Could not sign out', 'error'); }
+  },
+  // Used in confirm texts for destructive actions.
+  note() { return this.user ? ' This also changes your cloud data, so every signed-in device follows.' : ''; },
 };
 
 function migrate(d) {
@@ -3167,8 +3595,9 @@ function renderSettings() {
         <p class="muted">Dark mode is the default. Your choice is remembered.</p>
         <div class="seg"><button class="seg-btn ${S.settings.theme !== 'light' ? 'active' : ''}" data-action="set-theme" data-theme="dark">${icon('moon')} Dark</button><button class="seg-btn ${S.settings.theme === 'light' ? 'active' : ''}" data-action="set-theme" data-theme="light">${icon('sun')} Light</button></div>
       </div>
+      <div class="card" id="sync-card">${Sync.cardHTML()}</div>
       <div class="card"><div class="card-head"><h3>Storage</h3></div>
-        <p class="muted">Everything is stored in this browser's localStorage — nothing leaves your device. Clearing browser data deletes it, so export a backup regularly.</p>
+        <p class="muted">${Sync.user ? 'A copy is kept in this browser, and everything is synced to your cloud account (Firebase), private to your login.' : "Everything is stored in this browser's localStorage — nothing leaves your device. Clearing browser data deletes it, so sign in to cloud sync or export a backup regularly."}</p>
         <div class="storage"><div class="bar"><span style="width:${Math.min(100, Math.round(used / QUOTA * 100))}%"></span></div><span>${(used / 1048576).toFixed(2)} MB of ~5 MB</span></div>
         <p class="muted small mt">${counts.seasons} seasons · ${counts.weeks} weeks · ${S.body.length} body entries · ${PHOTOS.length} photos · ${S.notes.length} notes · ${S.library.length} library exercises</p>
         <p class="muted small">${ExImg.list.length} exercise images · ${(ExImg.bytes() / 1048576).toFixed(2)} MB · ${ExImg.mode === 'idb' ? "kept in the browser's IndexedDB (separate, much larger limit)" : ExImg.mode === 'ls' ? 'kept in localStorage (IndexedDB unavailable)' : 'not saved — this browser blocks storage'}</p>
@@ -3464,6 +3893,11 @@ const Actions = {
     removeCtx(c); Store.save(); renderLibrary(); toast('Removed from library');
   },
 
+  /* --- cloud sync --- */
+  'sync-open': () => Sync.open(),
+  'sync-reset': () => Sync.resetPassword(),
+  'sync-signout': () => Sync.signOut(),
+
   /* --- settings --- */
   'export': () => {
     Store.flush();
@@ -3476,11 +3910,11 @@ const Actions = {
     toast('Backup exported');
   },
   'load-sample': async () => {
-    if (!await confirmDialog('Replace all workouts, body entries, notes and library with the sample data? Photos are kept. Export a backup first if you want to keep your data.', { title: 'Load sample data', ok: 'Replace with sample' })) return;
+    if (!await confirmDialog('Replace all workouts, body entries, notes and library with the sample data? Photos are kept. Export a backup first if you want to keep your data.' + Sync.note(), { title: 'Load sample data', ok: 'Replace with sample' })) return;
     S = Seed.build(); Store.save(); Store.saveNow(); applyTheme(); location.hash = '#/dashboard'; render(); toast('Sample data loaded');
   },
   'reset-all': async () => {
-    if (!await confirmDialog('This permanently deletes <b>all</b> seasons, weeks, workouts, body entries, photos, notes and library exercises from this browser.', { title: 'Reset all data', ok: 'Delete everything', requireText: 'RESET' })) return;
+    if (!await confirmDialog('This permanently deletes <b>all</b> seasons, weeks, workouts, body entries, photos, notes and library exercises from this browser.' + Sync.note(), { title: 'Reset all data', ok: 'Delete everything', requireText: 'RESET' })) return;
     S = emptyData(); PHOTOS = []; UI.photoSel.clear();
     try { await ExImg.clear(); } catch (e) {}
     Store.save(); Store.saveNow(); Store.savePhotos(); render(); toast('All data deleted');
@@ -3539,7 +3973,7 @@ const Changes = {
         if (!Array.isArray((parsed.data || parsed).seasons)) throw new Error('Missing seasons');
       } catch (e) { toast('This file is not a valid Adrian Pump backup', 'error'); return; }
       const weeks = data.seasons.reduce((a, s) => a + s.weeks.length, 0);
-      if (!await confirmDialog(`Import ${data.seasons.length} seasons, ${weeks} weeks, ${data.body.length} body entries and ${data.notes.length} notes? This <b>replaces</b> all current data.`, { title: 'Import backup', ok: 'Import & replace', danger: false })) return;
+      if (!await confirmDialog(`Import ${data.seasons.length} seasons, ${weeks} weeks, ${data.body.length} body entries and ${data.notes.length} notes? This <b>replaces</b> all current data.${Sync.note()}`, { title: 'Import backup', ok: 'Import & replace', danger: false })) return;
       S = data;
       if (Array.isArray(parsed.photos)) PHOTOS = parsed.photos;
       let imgFail = 0;
@@ -3789,7 +4223,11 @@ buildShell();
 applyTheme();
 route();
 applyPatches();
-ExImg.load().then(() => { if (ExImg.list.length && (UI.view === 'training' || UI.view === 'settings')) render(); });
+// Cloud sync starts once exercise images are loaded, so it never mistakes them for deleted.
+ExImg.load().then(() => { if (ExImg.list.length && (UI.view === 'training' || UI.view === 'settings')) render(); Sync.start(); });
+window.addEventListener('online', () => { if (Sync.user && Sync.merged) { Sync.setState(Sync.pending ? 'saving' : 'synced'); Sync.push(); } });
+window.addEventListener('offline', () => { if (Sync.user) Sync.setState('offline'); });
+setInterval(() => { if (Sync.pendingRender) Sync.rerender(); }, 1000);
 </script>
 </body>
 </html>
